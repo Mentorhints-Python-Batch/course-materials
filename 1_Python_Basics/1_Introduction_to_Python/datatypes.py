@@ -9,3 +9,7 @@ print("Float:", b, "Type:", type(b))
 # String
 c = "Hello, Python!"
 print("String:", c, "Type:", type(c))
+
+# Boolean
+d = True
+print("Boolean:", d, "Type:", type(d))
