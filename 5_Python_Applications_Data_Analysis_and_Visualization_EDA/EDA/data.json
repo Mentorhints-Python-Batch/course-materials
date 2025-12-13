@@ -1,0 +1,29 @@
+[
+    {
+        "R No": 1,
+        "Name": "Ram",
+        "Tamil": 87,
+        "English": 43,
+        "Maths": 34,
+        "Science": 87,
+        "Social": 77
+    },
+    {
+        "R No": 2,
+        "Name": "Kumar",
+        "Tamil": 57,
+        "English": 73,
+        "Maths": 84,
+        "Science": 67,
+        "Social": 87
+    },
+    {
+        "R No": 3,
+        "Name": "Priya",
+        "Tamil": 97,
+        "English": 83,
+        "Maths": 74,
+        "Science": 77,
+        "Social": 67
+    }
+]
