@@ -1,0 +1,315 @@
+"""
+RNN-based Sentiment Analysis on Women's Clothing E-Commerce Reviews
+====================================================================
+Binary classification: Predicting whether a customer recommends a product
+using Vanilla RNN, LSTM, and GRU architectures.
+
+Dataset: Womens Clothing E-Commerce Reviews.csv
+Target: Recommended IND (0 = Not Recommended, 1 = Recommended)
+"""
+
+import os
+import re
+import time
+import string
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DATA_PATH = os.path.join(os.path.dirname(__file__), "Dataset", "Womens Clothing E-Commerce Reviews.csv")
+
+# ---------------------------------------------------------------------------
+# 1. Text Preprocessing
+# ---------------------------------------------------------------------------
+
+def clean_text(text: str) -> str:
+    """Lowercase, strip HTML, punctuation, and extra whitespace."""
+    if not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = re.sub(r"<.*?>", " ", text)
+    text = text.translate(str.maketrans("", "", string.punctuation))
+    text = re.sub(r"\d+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+class Vocabulary:
+    """Maps tokens to integer indices with special tokens for padding and unknowns."""
+
+    PAD_TOKEN = "<PAD>"
+    UNK_TOKEN = "<UNK>"
+
+    def __init__(self, max_size: int = 25_000, min_freq: int = 2):
+        self.max_size = max_size
+        self.min_freq = min_freq
+        self.token2idx = {self.PAD_TOKEN: 0, self.UNK_TOKEN: 1}
+        self.idx2token = {0: self.PAD_TOKEN, 1: self.UNK_TOKEN}
+
+    def build(self, texts: list[str]):
+        counter = Counter()
+        for text in texts:
+            counter.update(text.split())
+
+        common = counter.most_common(self.max_size)
+        idx = len(self.token2idx)
+        for word, freq in common:
+            if freq < self.min_freq:
+                continue
+            if word not in self.token2idx:
+                self.token2idx[word] = idx
+                self.idx2token[idx] = word
+                idx += 1
+
+    def encode(self, text: str, max_len: int) -> list[int]:
+        tokens = text.split()[:max_len]
+        indices = [self.token2idx.get(t, 1) for t in tokens]
+        indices += [0] * (max_len - len(indices))
+        return indices
+
+    def __len__(self):
+        return len(self.token2idx)
+
+
+# ---------------------------------------------------------------------------
+# 2. Dataset
+# ---------------------------------------------------------------------------
+
+class ReviewDataset(Dataset):
+    def __init__(self, texts: list[str], labels: list[int], vocab: Vocabulary, max_len: int = 200):
+        self.texts = texts
+        self.labels = labels
+        self.vocab = vocab
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        encoded = self.vocab.encode(self.texts[idx], self.max_len)
+        return (
+            torch.tensor(encoded, dtype=torch.long),
+            torch.tensor(self.labels[idx], dtype=torch.float),
+        )
+
+
+# ---------------------------------------------------------------------------
+# 3. Models
+# ---------------------------------------------------------------------------
+
+class VanillaRNN(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, output_dim,
+                 n_layers=2, dropout=0.3, pad_idx=0):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
+        self.rnn = nn.RNN(embed_dim, hidden_dim, num_layers=n_layers,
+                          batch_first=True, dropout=dropout, bidirectional=True)
+        self.fc = nn.Linear(hidden_dim * 2, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        embedded = self.dropout(self.embedding(x))
+        output, hidden = self.rnn(embedded)
+        hidden = torch.cat((hidden[-2], hidden[-1]), dim=1)
+        return self.fc(self.dropout(hidden)).squeeze(1)
+
+
+class LSTMClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, output_dim,
+                 n_layers=2, dropout=0.3, pad_idx=0):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers=n_layers,
+                            batch_first=True, dropout=dropout, bidirectional=True)
+        self.fc = nn.Linear(hidden_dim * 2, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        embedded = self.dropout(self.embedding(x))
+        output, (hidden, cell) = self.lstm(embedded)
+        hidden = torch.cat((hidden[-2], hidden[-1]), dim=1)
+        return self.fc(self.dropout(hidden)).squeeze(1)
+
+
+class GRUClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, output_dim,
+                 n_layers=2, dropout=0.3, pad_idx=0):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
+        self.gru = nn.GRU(embed_dim, hidden_dim, num_layers=n_layers,
+                          batch_first=True, dropout=dropout, bidirectional=True)
+        self.fc = nn.Linear(hidden_dim * 2, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        embedded = self.dropout(self.embedding(x))
+        output, hidden = self.gru(embedded)
+        hidden = torch.cat((hidden[-2], hidden[-1]), dim=1)
+        return self.fc(self.dropout(hidden)).squeeze(1)
+
+
+# ---------------------------------------------------------------------------
+# 4. Training & Evaluation
+# ---------------------------------------------------------------------------
+
+def train_one_epoch(model, loader, optimizer, criterion):
+    model.train()
+    total_loss, correct, total = 0, 0, 0
+    for texts, labels in loader:
+        texts, labels = texts.to(DEVICE), labels.to(DEVICE)
+        optimizer.zero_grad()
+        preds = model(texts)
+        loss = criterion(preds, labels)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+
+        total_loss += loss.item() * len(labels)
+        predicted = (torch.sigmoid(preds) >= 0.5).float()
+        correct += (predicted == labels).sum().item()
+        total += len(labels)
+
+    return total_loss / total, correct / total
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion):
+    model.eval()
+    total_loss, correct, total = 0, 0, 0
+    all_preds, all_labels = [], []
+    for texts, labels in loader:
+        texts, labels = texts.to(DEVICE), labels.to(DEVICE)
+        preds = model(texts)
+        loss = criterion(preds, labels)
+
+        total_loss += loss.item() * len(labels)
+        predicted = (torch.sigmoid(preds) >= 0.5).float()
+        correct += (predicted == labels).sum().item()
+        total += len(labels)
+        all_preds.extend(predicted.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+    return total_loss / total, correct / total, np.array(all_preds), np.array(all_labels)
+
+
+# ---------------------------------------------------------------------------
+# 5. Data Loading
+# ---------------------------------------------------------------------------
+
+def load_data():
+    df = pd.read_csv(DATA_PATH, index_col=0)
+    df = df.dropna(subset=["Review Text"])
+    df["clean_text"] = df["Review Text"].apply(clean_text)
+    df = df[df["clean_text"].str.len() > 0]
+
+    texts = df["clean_text"].tolist()
+    labels = df["Recommended IND"].tolist()
+
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        texts, labels, test_size=0.2, random_state=42, stratify=labels
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
+    )
+
+    vocab = Vocabulary(max_size=25_000, min_freq=2)
+    vocab.build(X_train)
+
+    return X_train, X_val, X_test, y_train, y_val, y_test, vocab
+
+
+# ---------------------------------------------------------------------------
+# 6. Main
+# ---------------------------------------------------------------------------
+
+def main():
+    print(f"Using device: {DEVICE}\n")
+
+    X_train, X_val, X_test, y_train, y_val, y_test, vocab = load_data()
+    print(f"Vocabulary size : {len(vocab):,}")
+    print(f"Train / Val / Test : {len(X_train):,} / {len(X_val):,} / {len(X_test):,}")
+
+    MAX_LEN = 200
+    BATCH_SIZE = 64
+    EMBED_DIM = 128
+    HIDDEN_DIM = 128
+    N_LAYERS = 2
+    DROPOUT = 0.3
+    LR = 1e-3
+    EPOCHS = 5
+
+    train_ds = ReviewDataset(X_train, y_train, vocab, MAX_LEN)
+    val_ds = ReviewDataset(X_val, y_val, vocab, MAX_LEN)
+    test_ds = ReviewDataset(X_test, y_test, vocab, MAX_LEN)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE)
+
+    models_config = {
+        "Vanilla RNN": VanillaRNN,
+        "LSTM": LSTMClassifier,
+        "GRU": GRUClassifier,
+    }
+
+    for name, ModelClass in models_config.items():
+        print(f"\n{'='*60}")
+        print(f"  Training {name}")
+        print(f"{'='*60}")
+
+        model = ModelClass(
+            vocab_size=len(vocab),
+            embed_dim=EMBED_DIM,
+            hidden_dim=HIDDEN_DIM,
+            output_dim=1,
+            n_layers=N_LAYERS,
+            dropout=DROPOUT,
+        ).to(DEVICE)
+
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Trainable parameters: {total_params:,}\n")
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+        criterion = nn.BCEWithLogitsLoss()
+
+        best_val_loss = float("inf")
+
+        for epoch in range(1, EPOCHS + 1):
+            t0 = time.time()
+            train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion)
+            val_loss, val_acc, _, _ = evaluate(model, val_loader, criterion)
+            elapsed = time.time() - t0
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), os.path.join(
+                    os.path.dirname(__file__), f"best_{name.lower().replace(' ', '_')}.pt"
+                ))
+
+            print(
+                f"Epoch {epoch}/{EPOCHS} | "
+                f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
+                f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} | "
+                f"Time: {elapsed:.1f}s"
+            )
+
+        model.load_state_dict(torch.load(os.path.join(
+            os.path.dirname(__file__), f"best_{name.lower().replace(' ', '_')}.pt"
+        ), weights_only=True))
+        test_loss, test_acc, preds, labels = evaluate(model, test_loader, criterion)
+
+        print(f"\n{name} Test Results  —  Loss: {test_loss:.4f}  Acc: {test_acc:.4f}")
+        print(classification_report(
+            labels, preds, target_names=["Not Recommended", "Recommended"]
+        ))
+
+
+if __name__ == "__main__":
+    main()
